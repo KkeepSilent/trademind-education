@@ -4,6 +4,16 @@
 /*  Types                                                              */
 /* ------------------------------------------------------------------ */
 
+function getRpcUrl(): string {
+  if (typeof window !== "undefined") {
+    const host = window.location.hostname;
+    if (host === "localhost" || host === "127.0.0.1") {
+      return "http://localhost:8899";
+    }
+  }
+  return "https://api.devnet.solana.com";
+}
+
 type PhantomProvider = {
   isPhantom?: boolean;
   publicKey?: { toString: () => string };
@@ -112,7 +122,7 @@ export async function sendSol(
 
   // Use Phantom's provider.request for transaction signing
   // This requires building the transaction as a base64-encoded message
-  const DEVNET_RPC = "http://localhost:8899";
+  const DEVNET_RPC = getRpcUrl();
 
   // Get recent blockhash
   const blockhashResp = await fetch(DEVNET_RPC, {
@@ -156,7 +166,7 @@ export async function getSolBalance(): Promise<number> {
   const pubkey = provider?.publicKey?.toString();
   if (!pubkey) return 0;
 
-  const DEVNET_RPC = "http://localhost:8899";
+  const DEVNET_RPC = getRpcUrl();
 
   const resp = await fetch(DEVNET_RPC, {
     method: "POST",

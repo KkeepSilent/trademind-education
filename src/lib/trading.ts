@@ -24,8 +24,14 @@ function getProvider(): PhantomProvider | null {
 }
 
 function getRpcUrl(): string {
-  // Use env variable if set, otherwise default to localhost
-  return "http://localhost:8899";
+  // In browser: use devnet for production, localhost for local dev
+  if (typeof window !== "undefined") {
+    const host = window.location.hostname;
+    if (host === "localhost" || host === "127.0.0.1") {
+      return "http://localhost:8899";
+    }
+  }
+  return "https://api.devnet.solana.com";
 }
 
 /* ------------------------------------------------------------------ */
