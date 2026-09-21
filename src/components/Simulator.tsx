@@ -196,7 +196,6 @@ export function Simulator({
   const [adminBalance, setAdminBalance] = useState(0);
   const [loadingBalance, setLoadingBalance] = useState(false);
   const [txPending, setTxPending] = useState(false);
-  const [useRealBlockchain, setUseRealBlockchain] = useState(false);
 
   /* — derived — */
   const activeCandle =
@@ -243,21 +242,27 @@ export function Simulator({
   );
 
   /* ---------------------------------------------------------------- */
-  /*  Fetch real balance                                               */
+  /*  Fetch balances — ALWAYS fetch both user + admin                  */
   /* ---------------------------------------------------------------- */
 
   async function refreshBalance() {
     if (!walletAddress) return;
     setLoadingBalance(true);
     try {
+      // Always fetch user balance
       const bal = await getSolBalance();
       setSolBalance(bal);
-      if (useRealBlockchain) {
-        const adminBal = await getAdminBalance();
-        setAdminBalance(adminBal);
-      }
       await updateSolBalance(walletAddress, bal);
       onBalanceChange?.(bal);
+
+      // Always fetch admin balance (no Phantom connection needed)
+      try {
+        const adminBal = await getAdminBalance();
+        setAdminBalance(adminBal);
+        console.log(`[Simulator] Admin balance: ${adminBal} SOL`);
+      } catch (e) {
+        console.error("[Simulator] Admin balance fetch failed:", e);
+      }
     } catch (e) {
       console.error("Balance fetch failed:", e);
     } finally {
@@ -270,6 +275,7 @@ export function Simulator({
       refreshBalance();
     } else {
       setSolBalance(0);
+      setAdminBalance(0);
     }
   }, [walletAddress]);
 
@@ -306,7 +312,6 @@ export function Simulator({
         }
       }
 
-      // Close positions that hit limits/stops
       for (const pos of toClose) {
         handleClosePosition(pos, currentPrice);
       }
@@ -357,7 +362,7 @@ export function Simulator({
   }
 
   /* ---------------------------------------------------------------- */
-  /*  Trade actions                                                    */
+  /*  Trade actions — ALWAYS real blockchain                           */
   /* ---------------------------------------------------------------- */
 
   async function handleOpenTrade() {
@@ -368,8 +373,7 @@ export function Simulator({
     const parsedTP = takeProfitInput ? parseFloat(takeProfitInput) : undefined;
 
     // Convert dollar amount to SOL for blockchain transfer
-    const solToUsdRate = 140; // approximate SOL price
-    const solAmount = dollarAmount / solToUsdRate;
+    const solAmount = dollarAmount / SOL_USD_RATE;
 
     const position: OpenPosition = {
       id: crypto.randomUUID(),
@@ -401,18 +405,25 @@ export function Simulator({
     setFeedbackList(feedback);
     onFeedback(feedback);
 
-    // Execute blockchain transaction for BUY orders (only in real mode)
+    // ALWAYS execute blockchain transaction for BUY orders
     let txSignature: string | undefined;
-    if (side === "buy" && walletAddress && useRealBlockchain) {
+    if (side === "buy" && walletAddress) {
       setTxPending(true);
       try {
-        // Auto-fund admin wallet if balance is low
-        const adminBal = await getAdminBalance();
-        if (adminBal < solAmount + 1) {
+        // Check admin balance first
+        let currentAdminBalance = adminBalance;
+        try {
+          currentAdminBalance = await getAdminBalance();
+          setAdminBalance(currentAdminBalance);
+        } catch {
+          // Use cached value
+        }
+
+        if (currentAdminBalance < solAmount + 0.01) {
           addToast({
             type: "error",
             title: "⚠️ Мало ликвидности на бирже",
-            message: `Админ-кошелёк: ${adminBal.toFixed(2)} SOL. Нужно минимум ${(solAmount + 1).toFixed(2)} SOL`,
+            message: `На бирже ${currentAdminBalance.toFixed(4)} SOL, нужно минимум ${(solAmount + 0.01).toFixed(4)} SOL`,
             duration: 5000,
           });
           setTxPending(false);
@@ -435,7 +446,7 @@ export function Simulator({
           duration: 5000,
         });
 
-        // Refresh balance after transaction
+        // Refresh balances after transaction
         setTimeout(refreshBalance, 2000);
       } catch (err) {
         const errorMsg = err instanceof Error ? err.message : String(err);
@@ -449,13 +460,6 @@ export function Simulator({
         return;
       }
       setTxPending(false);
-    } else if (side === "buy" && walletAddress) {
-      // Virtual mode — instant, no blockchain
-      addToast({
-        type: "success",
-        title: "🟢 Виртуальная покупка",
-        message: `${quantityTokens.toFixed(4)} ${scenario.asset} по $${currentPrice.toFixed(2)}`,
-      });
     }
 
     // Save to Supabase
@@ -483,7 +487,7 @@ export function Simulator({
       }
     }
 
-    // For market orders, add immediately; for limit/stop, add but show as pending
+    // Add position
     if (orderType === "market") {
       setPositions((prev) => [{ ...position, dbTradeId, txSignature }, ...prev]);
       setTradeError("");
@@ -491,7 +495,7 @@ export function Simulator({
       addToast({
         type: "success",
         title: `${side === "buy" ? "🟢 Куплено" : "🔴 Продано"}`,
-        message: `${quantityTokens.toFixed(4)} ${scenario.asset} по $${currentPrice.toFixed(2)}${txSignature ? ` | TX: ${txSignature.slice(0, 8)}...` : ""}`,
+        message: `${quantityTokens.toFixed(4)} ${scenario.asset} по $${currentPrice.toFixed(2)}`,
       });
     } else {
       setPositions((prev) => [{ ...position, dbTradeId, txSignature }, ...prev]);
@@ -529,14 +533,13 @@ export function Simulator({
     );
 
     // Calculate SOL to return
-    const solToUsdRate = 140;
-    const soldSolAmount = pos.dollarAmount / solToUsdRate;
-    const pnlSol = pnl / solToUsdRate;
-    const returnSol = soldSolAmount + pnlSol; // return original + profit (or - loss)
+    const soldSolAmount = pos.dollarAmount / SOL_USD_RATE;
+    const pnlSol = pnl / SOL_USD_RATE;
+    const returnSol = soldSolAmount + pnlSol;
 
     // Execute blockchain transaction for SELL (return SOL to user)
     let txSignature: string | undefined;
-    if (walletAddress && returnSol > 0 && useRealBlockchain) {
+    if (walletAddress && returnSol > 0) {
       setTxPending(true);
       try {
         addToast({
@@ -555,7 +558,6 @@ export function Simulator({
           duration: 5000,
         });
 
-        // Refresh balance after transaction
         setTimeout(refreshBalance, 2000);
       } catch (err) {
         const errorMsg = err instanceof Error ? err.message : String(err);
@@ -567,13 +569,6 @@ export function Simulator({
         });
       }
       setTxPending(false);
-    } else if (walletAddress && returnSol > 0) {
-      // Virtual mode — instant
-      addToast({
-        type: pnl >= 0 ? "success" : "error",
-        title: pnl >= 0 ? "🟢 Виртуальная продажа" : "🔴 Виртуальная продажа",
-        message: `P&L: ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}`,
-      });
     }
 
     const closedPos: ClosedPosition = {
@@ -620,10 +615,9 @@ export function Simulator({
     addToast({
       type: pnl >= 0 ? "success" : "error",
       title: pnl >= 0 ? "✅ Сделка закрыта" : "❌ Сделка закрыта",
-      message: `${pos.side === "buy" ? "Покупка" : "Продажа"} ${pos.asset} — P&L: ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)} | SOL: ${returnSol.toFixed(4)}`,
+      message: `${pos.side === "buy" ? "Покупка" : "Продажа"} ${pos.asset} — P&L: ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}`,
     });
 
-    // Remove from open positions
     setPositions((prev) => prev.filter((p) => p.id !== pos.id));
   }
 
@@ -654,39 +648,15 @@ export function Simulator({
           <Activity size={18} className="text-steel" />
           <h2 className="text-base font-bold">Симулятор</h2>
         </div>
-        <div className="flex items-center gap-3">
-          {/* Mode toggle */}
-          <div className="flex items-center gap-2">
-            <span className={`text-[10px] font-medium ${!useRealBlockchain ? "text-ink" : "text-ink/40"}`}>
-              Виртуальный
-            </span>
-            <button
-              onClick={() => setUseRealBlockchain(!useRealBlockchain)}
-              className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
-                useRealBlockchain ? "bg-mint" : "bg-ink/20"
-              }`}
-              type="button"
-            >
-              <span
-                className={`inline-block h-3.5 w-3.5 rounded-full bg-white shadow transition-transform ${
-                  useRealBlockchain ? "translate-x-4.5" : "translate-x-0.5"
-                }`}
-              />
-            </button>
-            <span className={`text-[10px] font-medium ${useRealBlockchain ? "text-ink" : "text-ink/40"}`}>
-              ⛓️ Реальный
-            </span>
-          </div>
-          <button
-            onClick={refreshBalance}
-            className="flex items-center gap-1 text-xs text-ink/40 hover:text-ink/70 transition"
-            type="button"
-            disabled={loadingBalance || !walletAddress}
-          >
-            <RefreshCw size={12} className={loadingBalance ? "animate-spin" : ""} />
-            Обновить
-          </button>
-        </div>
+        <button
+          onClick={refreshBalance}
+          className="flex items-center gap-1 text-xs text-ink/40 hover:text-ink/70 transition"
+          type="button"
+          disabled={loadingBalance || !walletAddress}
+        >
+          <RefreshCw size={12} className={loadingBalance ? "animate-spin" : ""} />
+          Обновить
+        </button>
       </div>
 
       {/* Scenario selector */}
@@ -747,58 +717,53 @@ export function Simulator({
         </span>
       </div>
 
-      {/* Available balance */}
-      <div className="mt-3 flex items-center justify-between text-xs text-ink/50">
-        <span>Доступно: ${availableBalance.toFixed(2)}</span>
-        <span>Баланс: {solBalance.toFixed(4)} SOL (${balanceUsd.toFixed(2)})</span>
+      {/* Balance info */}
+      <div className="mt-3 space-y-1.5">
+        <div className="flex items-center justify-between text-xs text-ink/50">
+          <span>Ваш баланс:</span>
+          <span className="font-medium">{solBalance.toFixed(4)} SOL (${balanceUsd.toFixed(2)})</span>
+        </div>
+        <div className="flex items-center justify-between text-xs text-ink/50">
+          <span>Доступно для торговли:</span>
+          <span className="font-medium">${availableBalance.toFixed(2)}</span>
+        </div>
       </div>
 
-      {/* Admin wallet info (real mode only) */}
-      {useRealBlockchain && (
-        <div className="mt-2 rounded-lg bg-ink/[0.03] px-3 py-2">
-          <div className="flex items-center justify-between text-[10px] text-ink/40">
-            <span>Админ-кошелёк (биржа):</span>
-            <a
-              href={`https://explorer.solana.com/address/DcsW1hiunJC4SW897Dje542L19aJMAFpMVv1KA51gTw9?cluster=devnet`}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="font-mono text-steel hover:underline"
-            >
-              DcsW...gTw9 ↗
-            </a>
-          </div>
-          <div className="flex items-center justify-between text-[10px] text-ink/40 mt-0.5">
-            <span>Ликвидность:</span>
-            <span>{adminBalance.toFixed(4)} SOL (${(adminBalance * 140).toFixed(2)})</span>
-          </div>
-          {adminBalance < 1 && (
-            <div className="mt-1.5 rounded bg-amber-50 border border-amber-200/50 px-2 py-1.5">
-              <p className="text-[10px] text-amber-700">
-                ⚠️ Пополните баланс биржи через{' '}
-                <a
-                  href="https://faucet.solana.com"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="font-bold underline"
-                >
-                  faucet.solana.com
-                </a>
-                {' '}(адрес: DcsW1hiunJC4SW897Dje542L19aJMAFpMVv1KA51gTw9)
-              </p>
-            </div>
-          )}
+      {/* Admin wallet info — always visible */}
+      <div className="mt-2 rounded-lg bg-ink/[0.03] px-3 py-2">
+        <div className="flex items-center justify-between text-[10px] text-ink/40">
+          <span>Биржа (ликвидность):</span>
+          <a
+            href={`https://explorer.solana.com/address/DcsW1hiunJC4SW897Dje542L19aJMAFpMVv1KA51gTw9?cluster=devnet`}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="font-mono text-steel hover:underline"
+          >
+            DcsW...gTw9 ↗
+          </a>
         </div>
-      )}
-
-      {/* Virtual mode info */}
-      {!useRealBlockchain && (
-        <div className="mt-2 rounded-lg bg-mint/5 border border-mint/20 px-3 py-2">
-          <p className="text-[10px] text-ink/50">
-            💡 <strong>Виртуальный режим</strong> — сделки мгновенные, баланс виртуальный. 
-            Переключи на ⛓️ Реальный для блокчейн-трансакций.
-          </p>
+        <div className="flex items-center justify-between text-[10px] text-ink/40 mt-0.5">
+          <span>Баланс биржи:</span>
+          <span className={`font-medium ${adminBalance > 1 ? "text-mint" : "text-coral"}`}>
+            {adminBalance.toFixed(4)} SOL (${(adminBalance * SOL_USD_RATE).toFixed(2)})
+          </span>
         </div>
-      )}
+        {adminBalance < 0.1 && adminBalance > 0 && (
+          <div className="mt-1.5 rounded bg-amber-50 border border-amber-200/50 px-2 py-1.5">
+            <p className="text-[10px] text-amber-700">
+              ⚠️ Пополните биржу через{' '}
+              <a
+                href="https://faucet.solana.com"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="font-bold underline"
+              >
+                faucet.solana.com
+              </a>
+            </p>
+          </div>
+        )}
+      </div>
 
       {/* Pending orders */}
       {pendingOrders.length > 0 && (
@@ -950,11 +915,11 @@ export function Simulator({
             className="w-full rounded-lg border border-ink/10 bg-white/72 px-3 py-2 text-sm font-medium outline-none focus:border-ink/30"
           />
           <p className="mt-1 text-[10px] text-ink/40">
-            ≈ {quantityTokens.toFixed(4)} {scenario.asset}
+            ≈ {quantityTokens.toFixed(4)} {scenario.asset} ({(dollarAmount / SOL_USD_RATE).toFixed(4)} SOL)
           </p>
         </div>
 
-        {/* Limit price (for limit orders) */}
+        {/* Limit price */}
         {orderType === "limit" && (
           <div>
             <label className="block text-xs font-medium text-ink/50 mb-1">
@@ -969,9 +934,6 @@ export function Simulator({
               placeholder={`Текущая: $${currentPrice.toFixed(2)}`}
               className="w-full rounded-lg border border-ink/10 bg-white/72 px-3 py-2 text-sm font-medium outline-none focus:border-ink/30"
             />
-            <p className="mt-1 text-[10px] text-ink/40">
-              Исполнится когда цена достигнет значения
-            </p>
           </div>
         )}
 
@@ -1021,12 +983,6 @@ export function Simulator({
             onChange={(e) => setRiskPercent(parseFloat(e.target.value))}
             className="w-full accent-ink"
           />
-          <div className="flex justify-between text-[10px] text-ink/40">
-            <span>0.5%</span>
-            <span>1%</span>
-            <span>3%</span>
-            <span>5%</span>
-          </div>
         </div>
 
         {/* Error */}
@@ -1048,15 +1004,13 @@ export function Simulator({
           {txPending ? (
             <>
               <RefreshCw size={16} className="animate-spin" />
-              Трансакция...
+              Отправка трансакции...
             </>
           ) : (
             <>
               <PlayCircle size={16} />
               {orderType === "market"
-                ? useRealBlockchain
-                  ? `Купить (${side === "buy" ? "SOL →" : "← SOL"})`
-                  : `Открыть сделку`
+                ? `Купить ${scenario.asset} за $${dollarAmount}`
                 : `Создать ордер`}
             </>
           )}
