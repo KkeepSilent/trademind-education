@@ -91,7 +91,7 @@ export async function buySol(solAmount: number): Promise<string> {
   console.log(`[Trading] from: ${fromPubkey.toString()}`);
   console.log(`[Trading] to: ${ADMIN_PUBLIC_KEY}`);
 
-  // Build transaction with @solana/web3.js
+  // Build transaction
   const transaction = new Transaction();
   transaction.add(
     SystemProgram.transfer({
@@ -100,10 +100,11 @@ export async function buySol(solAmount: number): Promise<string> {
       lamports,
     })
   );
-
-  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
-  transaction.recentBlockhash = blockhash;
   transaction.feePayer = fromPubkey;
+
+  // Fetch blockhash RIGHT before sending (minimizes expiry risk)
+  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("finalized");
+  transaction.recentBlockhash = blockhash;
 
   console.log(`[Trading] tx built, blockhash: ${blockhash}`);
 
@@ -112,17 +113,18 @@ export async function buySol(solAmount: number): Promise<string> {
     if (provider.signAndSendTransaction) {
       console.log("[Trading] Calling signAndSendTransaction...");
       const result = await provider.signAndSendTransaction(transaction, {
-        skipPreflight: false,
-        preflightCommitment: "confirmed",
+        skipPreflight: true,
       });
       console.log("[Trading] ✅ Sent:", result.signature);
 
-      // Confirm the transaction
+      // Confirm with retry strategy
       console.log("[Trading] Confirming...");
-      const confirmation = await connection.confirmTransaction(
-        { signature: result.signature, blockhash, lastValidBlockHeight },
-        "confirmed"
-      );
+      const strategy = {
+        signature: result.signature,
+        blockhash,
+        lastValidBlockHeight,
+      };
+      const confirmation = await connection.confirmTransaction(strategy, "processed");
       if (confirmation.value.err) {
         throw new Error(`Transaction failed: ${JSON.stringify(confirmation.value.err)}`);
       }
