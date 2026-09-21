@@ -11,7 +11,6 @@ import {
   Transaction,
   SystemProgram,
   LAMPORTS_PER_SOL,
-  VersionedTransaction,
 } from "@solana/web3.js";
 
 const ADMIN_PUBLIC_KEY = "DcsW1hiunJC4SW897Dje542L19aJMAFpMVv1KA51gTw9";
@@ -112,15 +111,27 @@ export async function buySol(solAmount: number): Promise<string> {
   try {
     let signature: string;
 
-    if (provider.signAndSendTransaction) {
-      console.log("[Trading] Calling signAndSendTransaction...");
+    if (provider.signTransaction) {
+      // Method 1: Phantom ONLY signs — we send ourselves (fastest, no blockhash expiry)
+      console.log("[Trading] Using signTransaction (sign only)...");
+      const signed = await provider.signTransaction(transaction);
+      const signedBytes = (signed as Transaction).serialize();
+      console.log("[Trading] Signed, sending via RPC...");
+      signature = await connection.sendRawTransaction(signedBytes, {
+        skipPreflight: true,
+      });
+      console.log("[Trading] ✅ Sent:", signature);
+    } else if (provider.signAndSendTransaction) {
+      // Method 2: Phantom signs + sends (may timeout on confirmation)
+      console.log("[Trading] Using signAndSendTransaction...");
       const result = await provider.signAndSendTransaction(transaction, {
         skipPreflight: true,
       });
       signature = result.signature;
       console.log("[Trading] ✅ Sent:", signature);
     } else if (provider.request) {
-      console.log("[Trading] Using request API as fallback...");
+      // Method 3: request API
+      console.log("[Trading] Using request API...");
       const serializedTx = transaction.serialize({
         requireAllSignatures: false,
         verifySignatures: false,
@@ -139,9 +150,6 @@ export async function buySol(solAmount: number): Promise<string> {
       throw new Error("Phantom не поддерживает отправку транзакций");
     }
 
-    // Return signature immediately — don't block on confirmation
-    // Confirmation may fail due to blockhash expiry, but the tx is already sent
-    console.log("[Trading] Returning signature (confirmation will happen async)");
     return signature;
 
   } catch (err) {
