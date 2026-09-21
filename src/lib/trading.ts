@@ -2,11 +2,11 @@
 
 /* ------------------------------------------------------------------ */
 /*  Trading — SOL transfers via Phantom                                */
-/*  Uses @solana/web3.js loaded from CDN at runtime                    */
+/*  Pure browser: Solana transactions serialized manually              */
+/*  No @solana/web3.js needed                                          */
 /* ------------------------------------------------------------------ */
 
 const ADMIN_PUBLIC_KEY = "DcsW1hiunJC4SW897Dje542L19aJMAFpMVv1KA51gTw9";
-const CDN_URL = "https://unpkg.com/@solana/web3.js@latest/lib/index.iife.min.js";
 
 type PhantomProvider = {
   isPhantom?: boolean;
@@ -17,12 +17,6 @@ type PhantomProvider = {
   signAndSendTransaction?: (tx: unknown, opts?: unknown) => Promise<{ signature: string }>;
   request?: (args: { method: string; params?: Record<string, unknown> }) => Promise<unknown>;
 };
-
-declare global {
-  interface Window {
-    SolanaWeb3?: unknown;
-  }
-}
 
 function getProvider(): PhantomProvider | null {
   if (typeof window === "undefined") return null;
@@ -41,32 +35,71 @@ function getRpcUrl(): string {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Load @solana/web3.js from CDN                                      */
+/*  Base58 encode/decode                                               */
 /* ------------------------------------------------------------------ */
 
-let _web3Loaded = false;
-let _web3LoadPromise: Promise<void> | null = null;
+const BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
-async function loadWeb3(): Promise<typeof window.SolanaWeb3> {
-  if (window.SolanaWeb3) return window.SolanaWeb3;
-  if (_web3LoadPromise) {
-    await _web3LoadPromise;
-    return window.SolanaWeb3!;
+function base58Encode(bytes: Uint8Array): string {
+  const digits = [0];
+  for (const byte of bytes) {
+    let carry = byte;
+    for (let j = 0; j < digits.length; j++) {
+      carry += digits[j] << 8;
+      digits[j] = carry % 58;
+      carry = (carry / 58) | 0;
+    }
+    while (carry > 0) {
+      digits.push(carry % 58);
+      carry = (carry / 58) | 0;
+    }
   }
+  let result = "";
+  for (const byte of bytes) {
+    if (byte === 0) result += "1";
+    else break;
+  }
+  for (let i = digits.length - 1; i >= 0; i--) {
+    result += BASE58_ALPHABET[digits[i]];
+  }
+  return result;
+}
 
-  _web3LoadPromise = new Promise((resolve, reject) => {
-    const script = document.createElement("script");
-    script.src = CDN_URL;
-    script.onload = () => {
-      _web3Loaded = true;
-      resolve();
-    };
-    script.onerror = () => reject(new Error("Failed to load @solana/web3.js"));
-    document.head.appendChild(script);
-  });
+function base58Decode(str: string): Uint8Array {
+  const bytes = [0];
+  for (const char of str) {
+    const index = BASE58_ALPHABET.indexOf(char);
+    if (index === -1) throw new Error(`Invalid base58 character: ${char}`);
+    let carry = index;
+    for (let j = 0; j < bytes.length; j++) {
+      carry += bytes[j] * 58;
+      bytes[j] = carry & 0xff;
+      carry >>= 8;
+    }
+    while (carry > 0) {
+      bytes.push(carry & 0xff);
+      carry >>= 8;
+    }
+  }
+  for (const char of str) {
+    if (char === "1") bytes.unshift(0);
+    else break;
+  }
+  return new Uint8Array(bytes.reverse());
+}
 
-  await _web3LoadPromise;
-  return window.SolanaWeb3!;
+/* ------------------------------------------------------------------ */
+/*  Solana address <-> bytes                                           */
+/* ------------------------------------------------------------------ */
+
+const PUBKEY_LENGTH = 32;
+
+function addressToBytes(address: string): Uint8Array {
+  return base58Decode(address);
+}
+
+function bytesToAddress(bytes: Uint8Array): string {
+  return base58Encode(bytes);
 }
 
 /* ------------------------------------------------------------------ */
@@ -76,7 +109,6 @@ async function loadWeb3(): Promise<typeof window.SolanaWeb3> {
 export async function getSolBalance(): Promise<number> {
   const provider = getProvider();
   if (!provider?.publicKey) return 0;
-
   const walletAddress = provider.publicKey.toString();
 
   try {
@@ -90,11 +122,8 @@ export async function getSolBalance(): Promise<number> {
         params: [walletAddress],
       }),
     });
-
     const data = await response.json();
-    if (data.result?.value !== undefined) {
-      return data.result.value / 1e9;
-    }
+    if (data.result?.value !== undefined) return data.result.value / 1e9;
     return 0;
   } catch (err) {
     console.error("[Trading] getSolBalance error:", err);
@@ -114,11 +143,8 @@ export async function getAdminBalance(): Promise<number> {
         params: [ADMIN_PUBLIC_KEY],
       }),
     });
-
     const data = await response.json();
-    if (data.result?.value !== undefined) {
-      return data.result.value / 1e9;
-    }
+    if (data.result?.value !== undefined) return data.result.value / 1e9;
     return 0;
   } catch (err) {
     console.error("[Trading] getAdminBalance error:", err);
@@ -127,7 +153,8 @@ export async function getAdminBalance(): Promise<number> {
 }
 
 /* ------------------------------------------------------------------ */
-/*  SOL Transfer using @solana/web3.js from CDN                        */
+/*  SOL Transfer — Pure Solana transaction serialization                */
+/*  Format: https://docs.solana.com/developing/programming-model/transactions */
 /* ------------------------------------------------------------------ */
 
 export async function buySol(solAmount: number): Promise<string> {
@@ -135,74 +162,158 @@ export async function buySol(solAmount: number): Promise<string> {
   if (!provider) throw new Error("Phantom не подключён");
   if (!provider.publicKey) throw new Error("Кошелёк не подключён");
 
-  const web3 = await loadWeb3() as Record<string, unknown>;
-  const Connection = web3.Connection as new (endpoint: string, commitment?: string) => { getLatestBlockhash(): Promise<{ blockhash: string; lastValidBlockHeight: number }>; sendRawTransaction(serialized: Uint8Array): Promise<string> };
-  const PublicKey = web3.PublicKey as new (key: string) => { toString(): string };
-  const Transaction = web3.Transaction as new () => { recentBlockhash?: string; feePayer?: { toString(): string }; add(...args: unknown[]): void; serialize(): Uint8Array };
-  const SystemProgram = web3.SystemProgram as { transfer(args: { fromPubkey: { toString(): string }; toPubkey: { toString(): string }; lamports: number }): unknown };
-  const LAMPORTS_PER_SOL = web3.LAMPORTS_PER_SOL as number;
+  const fromAddress = provider.publicKey.toString();
+  const fromPubkey = addressToBytes(fromAddress);
+  const toPubkey = addressToBytes(ADMIN_PUBLIC_KEY);
 
-  const connection = new Connection(getRpcUrl(), "confirmed");
-  const fromPubkey = new PublicKey(provider.publicKey.toString());
-  const toPubkey = new PublicKey(ADMIN_PUBLIC_KEY);
+  const LAMPORTS_PER_SOL = 1_000_000_000;
   const lamports = Math.round(solAmount * LAMPORTS_PER_SOL);
 
   console.log(`[Trading] buySol: ${solAmount} SOL (${lamports} lamports)`);
-  console.log(`[Trading] from: ${fromPubkey.toString()}`);
-  console.log(`[Trading] to: ${toPubkey.toString()}`);
+  console.log(`[Trading] from: ${fromAddress}`);
+  console.log(`[Trading] to: ${ADMIN_PUBLIC_KEY}`);
 
-  // Build transaction
-  const transaction = new Transaction();
-  transaction.add(
-    SystemProgram.transfer({
-      fromPubkey,
-      toPubkey,
-      lamports,
-    })
+  // 1. Get recent blockhash
+  const blockhashResp = await fetch(getRpcUrl(), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "getLatestBlockhash",
+      params: [{ commitment: "finalized" }],
+    }),
+  });
+  const blockhashData = await blockhashResp.json();
+  if (blockhashData.error) throw new Error(`Blockhash error: ${blockhashData.error.message}`);
+  const blockhash = blockhashData.result.value.blockhash;
+  const blockhashBytes = addressToBytes(blockhash);
+
+  console.log(`[Trading] blockhash: ${blockhash}`);
+
+  // 2. Build System Program Transfer instruction
+  //    Program: 11111111111111111111111111111111 (System Program)
+  //    Instruction 2 = Transfer
+  //    Data: [2, 0, 0, 0, ...lamports_le(8 bytes)]
+  const SYSTEM_PROGRAM = addressToBytes("11111111111111111111111111111111");
+  const SYSTEM_PROGRAM_INDEX = 0; // will be assigned after sorting accounts
+
+  // Transfer instruction data: 4 bytes (instruction index) + 8 bytes (lamports LE)
+  const instructionData = new Uint8Array(12);
+  instructionData[0] = 2; // Transfer instruction
+  // lamports as little-endian 64-bit integer
+  instructionData[4] = lamports & 0xff;
+  instructionData[5] = (lamports >> 8) & 0xff;
+  instructionData[6] = (lamports >> 16) & 0xff;
+  instructionData[7] = (lamports >> 24) & 0xff;
+  instructionData[8] = (lamports >> 32) & 0xff;
+  instructionData[9] = (lamports >> 40) & 0xff;
+  instructionData[10] = (lamports >> 48) & 0xff;
+  instructionData[11] = (lamports >> 56) & 0xff;
+
+  // 3. Sort accounts (Solana requirement: signer writable first, signer read-only second, etc.)
+  //    Accounts: [from (signer+writable), system_program (readonly)]
+  //    Also need to include admin wallet as a non-signer? No — just the System Program transfer.
+  //    Actually for a simple transfer, accounts = [fromPubkey, toPubkey, systemProgram]
+  //    But we need to be careful about the account ordering.
+
+  // For SystemProgram.transfer, the accounts are:
+  // 0: from (signer, writable)
+  // 1: to (writable)
+  // program: system program (readonly)
+
+  // Solana account order:
+  // 1. Signers that are writable (from)
+  // 2. Signers that are read-only (none)
+  // 3. Non-signers that are writable (to)
+  // 4. Non-signers that are read-only (system program)
+
+  const accounts = [
+    { pubkey: fromPubkey, isSigner: true, isWritable: true },    // index 0
+    { pubkey: toPubkey, isSigner: false, isWritable: true },     // index 1
+    { pubkey: SYSTEM_PROGRAM, isSigner: false, isWritable: false }, // index 2
+  ];
+
+  // 4. Serialize message
+  // Header
+  const header = new Uint8Array([
+    1,  // num_required_signatures (1 = only fromPubkey)
+    0,  // num_readonly_signed_accounts
+    1,  // num_readonly_unsigned_accounts (system program)
+  ]);
+
+  // Compact array of account pubkeys
+  const accountsBuffer = new Uint8Array(32 * accounts.length);
+  for (let i = 0; i < accounts.length; i++) {
+    accountsBuffer.set(accounts[i].pubkey, i * 32);
+  }
+
+  // Recent blockhash (32 bytes)
+  // Already have blockhashBytes
+
+  // Instructions compact array
+  // One instruction:
+  // - program_id_index: 1 byte (index 2 = system program)
+  // - account_indices: [0, 1] (from, to)
+  // - instruction_data: 12 bytes
+  const programIdIndex = 2; // system program is at index 2
+  const accountIndices = new Uint8Array([0, 1]); // from, to
+
+  // Instruction serialized: [program_id_index, account_indices_len, ...account_indices, data_len, ...data]
+  const instructionSerialized = new Uint8Array(1 + 1 + accountIndices.length + 1 + instructionData.length);
+  instructionSerialized[0] = programIdIndex;
+  instructionSerialized[1] = accountIndices.length;
+  instructionSerialized.set(accountIndices, 2);
+  instructionSerialized[2 + accountIndices.length] = instructionData.length;
+  instructionSerialized.set(instructionData, 3 + accountIndices.length);
+
+  // Compact array of instructions
+  const instructionsCompactArray = new Uint8Array(1 + instructionSerialized.length);
+  instructionsCompactArray[0] = 1; // 1 instruction
+  instructionsCompactArray.set(instructionSerialized, 1);
+
+  // 5. Assemble message
+  const message = new Uint8Array(
+    header.length + accountsBuffer.length + 32 + instructionsCompactArray.length
   );
+  let offset = 0;
+  message.set(header, offset); offset += header.length;
+  message.set(accountsBuffer, offset); offset += accountsBuffer.length;
+  message.set(blockhashBytes, offset); offset += 32;
+  message.set(instructionsCompactArray, offset);
 
-  // Get recent blockhash
-  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
-  transaction.recentBlockhash = blockhash;
-  transaction.feePayer = fromPubkey;
+  console.log(`[Trading] message length: ${message.length} bytes`);
 
-  console.log(`[Trading] Blockhash: ${blockhash}`);
-
-  // Sign and send via Phantom
+  // 6. Send to Phantom for signing + sending
+  //    Phantom accepts { transaction: number[], chain: "solana:mainnet-beta" | "solana:devnet" }
   try {
-    // Method 1: signAndSendTransaction (preferred)
     if (provider.signAndSendTransaction) {
-      console.log("[Trading] Using signAndSendTransaction...");
-      const result = await provider.signAndSendTransaction(transaction, {
-        skipPreflight: false,
-        preflightCommitment: "processed",
-      });
-      console.log("[Trading] Transaction sent:", result.signature);
-      return result.signature;
-    }
+      console.log("[Trading] Using signAndSendTransaction with message bytes...");
 
-    // Method 2: signTransaction then send manually
-    if (provider.signTransaction) {
-      console.log("[Trading] Using signTransaction...");
-      const signed = await provider.signTransaction(transaction);
-      const serialized = (signed as { serialize(): Uint8Array }).serialize();
-      const signature = await connection.sendRawTransaction(serialized);
-      console.log("[Trading] Transaction sent:", signature);
-      return signature;
+      // Try sending as serialized message
+      const result = await provider.signAndSendTransaction(
+        { transaction: Array.from(message), chain: "solana:devnet" },
+        { skipPreflight: false, preflightCommitment: "processed" }
+      );
+
+      console.log("[Trading] ✅ Transaction confirmed:", result.signature);
+      return result.signature;
     }
 
     throw new Error("Phantom не поддерживает отправку трансакций");
   } catch (err) {
-    console.error("[Trading] Transaction failed:", err);
+    console.error("[Trading] ❌ Transaction failed:", err);
     const msg = err instanceof Error ? err.message : String(err);
-    throw new Error(`Трансакция отклонена: ${msg}`);
+    throw new Error(`Транзакция отклонена: ${msg}`);
   }
 }
 
+/* ------------------------------------------------------------------ */
+/*  Sell (MVP placeholder)                                             */
+/* ------------------------------------------------------------------ */
+
 export async function sellSol(solAmount: number, userWallet: string): Promise<string> {
   console.log(`[Trading] Sell request: ${solAmount} SOL to ${userWallet}`);
-
-  // For MVP, record the sell intent
   return "sell-pending";
 }
 
@@ -260,8 +371,8 @@ export async function getTransactionHistory(
 
           const preBalances = tx.meta.preBalances || [];
           const postBalances = tx.meta.postBalances || [];
-
           const accountKeys = tx.transaction?.message?.accountKeys || [];
+
           const walletIndex = accountKeys.findIndex(
             (key: { pubkey?: string } | string) =>
               typeof key === "string" ? key === walletAddress : key?.pubkey === walletAddress
