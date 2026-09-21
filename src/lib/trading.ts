@@ -90,9 +90,9 @@ export async function buySol(solAmount: number): Promise<string> {
   console.log(`[Trading] from: ${fromPubkey.toString()}`);
   console.log(`[Trading] to: ${ADMIN_PUBLIC_KEY}`);
 
-  // Get fresh blockhash RIGHT before popup
-  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("finalized");
-  console.log(`[Trading] blockhash: ${blockhash}`);
+  // Get fresh blockhash — use "confirmed" (finalized is too old on devnet)
+  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
+  console.log(`[Trading] blockhash: ${blockhash}, lastValidBlockHeight: ${lastValidBlockHeight}`);
 
   // Build transaction
   const transaction = new Transaction();
