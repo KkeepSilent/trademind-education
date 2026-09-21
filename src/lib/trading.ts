@@ -2,7 +2,7 @@
 
 /* ------------------------------------------------------------------ */
 /*  Trading — SOL transfers via Phantom                                */
-/*  Uses @solana/web3.js (installed via npm)                           */
+/*  Uses @solana/web3.js (npm)                                         */
 /* ------------------------------------------------------------------ */
 
 import {
@@ -20,8 +20,8 @@ type PhantomProvider = {
   publicKey?: { toString(): string };
   connect: () => Promise<{ publicKey: { toString(): string } }>;
   disconnect?: () => Promise<void>;
-  signTransaction?: (tx: unknown) => Promise<unknown>;
-  signAndSendTransaction?: (tx: unknown, opts?: unknown) => Promise<{ signature: string }>;
+  signTransaction?: (tx: Transaction) => Promise<Transaction>;
+  signAndSendTransaction?: (tx: Transaction, opts?: unknown) => Promise<{ signature: string }>;
   request?: (args: { method: string; params?: Record<string, unknown> }) => Promise<unknown>;
 };
 
@@ -90,8 +90,14 @@ export async function buySol(solAmount: number): Promise<string> {
   console.log(`[Trading] from: ${fromPubkey.toString()}`);
   console.log(`[Trading] to: ${ADMIN_PUBLIC_KEY}`);
 
+  // Get fresh blockhash RIGHT before popup
+  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("finalized");
+  console.log(`[Trading] blockhash: ${blockhash}`);
+
   // Build transaction
   const transaction = new Transaction();
+  transaction.feePayer = fromPubkey;
+  transaction.recentBlockhash = blockhash;
   transaction.add(
     SystemProgram.transfer({
       fromPubkey,
@@ -99,39 +105,22 @@ export async function buySol(solAmount: number): Promise<string> {
       lamports,
     })
   );
-  transaction.feePayer = fromPubkey;
 
-  // Fetch blockhash RIGHT before sending (minimizes expiry risk)
-  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("finalized");
-  transaction.recentBlockhash = blockhash;
-
-  console.log(`[Trading] tx built, blockhash: ${blockhash}`);
-
-  // Sign and send via Phantom
+  // Sign with Phantom
+  let signedTransaction: Transaction;
   try {
-    let signature: string;
-
     if (provider.signTransaction) {
-      // Method 1: Phantom ONLY signs — we send ourselves (fastest, no blockhash expiry)
-      console.log("[Trading] Using signTransaction (sign only)...");
-      const signed = await provider.signTransaction(transaction);
-      const signedBytes = (signed as Transaction).serialize();
-      console.log("[Trading] Signed, sending via RPC...");
-      signature = await connection.sendRawTransaction(signedBytes, {
-        skipPreflight: true,
-      });
-      console.log("[Trading] ✅ Sent:", signature);
+      console.log("[Trading] Phantom: signTransaction...");
+      signedTransaction = await provider.signTransaction(transaction);
     } else if (provider.signAndSendTransaction) {
-      // Method 2: Phantom signs + sends (may timeout on confirmation)
-      console.log("[Trading] Using signAndSendTransaction...");
+      console.log("[Trading] Phantom: signAndSendTransaction...");
       const result = await provider.signAndSendTransaction(transaction, {
         skipPreflight: true,
       });
-      signature = result.signature;
-      console.log("[Trading] ✅ Sent:", signature);
+      console.log("[Trading] ✅ Sent:", result.signature);
+      return result.signature;
     } else if (provider.request) {
-      // Method 3: request API
-      console.log("[Trading] Using request API...");
+      console.log("[Trading] Phantom: request API...");
       const serializedTx = transaction.serialize({
         requireAllSignatures: false,
         verifySignatures: false,
@@ -144,18 +133,37 @@ export async function buySol(solAmount: number): Promise<string> {
           options: { skipPreflight: true },
         },
       })) as { signature: string };
-      signature = result.signature;
-      console.log("[Trading] ✅ Sent via request:", signature);
+      console.log("[Trading] ✅ Sent:", result.signature);
+      return result.signature;
     } else {
       throw new Error("Phantom не поддерживает отправку транзакций");
     }
-
-    return signature;
-
   } catch (err) {
-    console.error("[Trading] ❌ Transaction failed:", err);
     const msg = err instanceof Error ? err.message : String(err);
+    // If blockhash expired during popup, retry once
+    if (msg.includes("expired") || msg.includes("blockhash")) {
+      console.log("[Trading] Blockhash expired during signing, retrying...");
+      return buySol(solAmount); // Recursive retry with fresh blockhash
+    }
     throw new Error(`Транзакция отклонена: ${msg}`);
+  }
+
+  // Send via RPC (Phantom only signed, didn't send)
+  try {
+    console.log("[Trading] Sending signed tx via RPC...");
+    const rawTx = signedTransaction.serialize();
+    console.log(`[Trading] Raw tx size: ${rawTx.length} bytes`);
+
+    const signature = await connection.sendRawTransaction(rawTx, {
+      skipPreflight: true,
+      maxRetries: 3,
+    });
+
+    console.log("[Trading] ✅ Sent:", signature);
+    return signature;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`Ошибка отправки: ${msg}`);
   }
 }
 
