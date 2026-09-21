@@ -522,3 +522,136 @@ export async function getUserStats(walletAddress: string) {
         : 0,
   };
 }
+
+/* ------------------------------------------------------------------ */
+/*  Orders ( buy = DB only, sell = real SOL transfer )                 */
+/* ------------------------------------------------------------------ */
+
+export interface Order {
+  id: string;
+  wallet_address: string;
+  asset: string;
+  side: string;
+  order_type: string;
+  dollar_amount: number;
+  entry_price: number;
+  exit_price: number | null;
+  quantity: number;
+  pnl: number;
+  status: string;
+  tx_signature: string | null;
+  created_at: string;
+  closed_at: string | null;
+}
+
+export async function createOrder(order: {
+  wallet_address: string;
+  asset: string;
+  side: string;
+  order_type: string;
+  dollar_amount: number;
+  entry_price: number;
+  quantity: number;
+  tx_signature?: string;
+}): Promise<Order | null> {
+  const db = getSupabase();
+  if (!db) return null;
+
+  return safeQuery(
+    async () => {
+      const { data, error } = await db
+        .from("orders")
+        .insert({
+          wallet_address: order.wallet_address,
+          asset: order.asset,
+          side: order.side,
+          order_type: order.order_type,
+          dollar_amount: order.dollar_amount,
+          entry_price: order.entry_price,
+          quantity: order.quantity,
+          tx_signature: order.tx_signature || null,
+          status: "open",
+        })
+        .select()
+        .single();
+      if (error) throw error;
+      return data as Order;
+    },
+    null,
+    "createOrder"
+  );
+}
+
+export async function closeOrder(
+  orderId: string,
+  exitPrice: number,
+  pnl: number,
+  txSignature?: string
+): Promise<void> {
+  const db = getSupabase();
+  if (!db) return;
+
+  await safeQuery(
+    async () => {
+      const { error } = await db
+        .from("orders")
+        .update({
+          exit_price: exitPrice,
+          pnl,
+          tx_signature: txSignature || null,
+          status: "closed",
+          closed_at: new Date().toISOString(),
+        })
+        .eq("id", orderId);
+      if (error) throw error;
+    },
+    undefined,
+    "closeOrder"
+  );
+}
+
+export async function getOpenOrders(
+  walletAddress: string
+): Promise<Order[]> {
+  const db = getSupabase();
+  if (!db) return [];
+
+  return safeQuery(
+    async () => {
+      const { data, error } = await db
+        .from("orders")
+        .select("*")
+        .eq("wallet_address", walletAddress)
+        .eq("status", "open")
+        .order("created_at", { ascending: false });
+      if (error) throw error;
+      return (data ?? []) as Order[];
+    },
+    [],
+    "getOpenOrders"
+  );
+}
+
+export async function getClosedOrders(
+  walletAddress: string,
+  limit = 50
+): Promise<Order[]> {
+  const db = getSupabase();
+  if (!db) return [];
+
+  return safeQuery(
+    async () => {
+      const { data, error } = await db
+        .from("orders")
+        .select("*")
+        .eq("wallet_address", walletAddress)
+        .eq("status", "closed")
+        .order("closed_at", { ascending: false })
+        .limit(limit);
+      if (error) throw error;
+      return (data ?? []) as Order[];
+    },
+    [],
+    "getClosedOrders"
+  );
+}

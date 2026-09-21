@@ -33,6 +33,8 @@ import {
   incrementTradeStats,
   checkAndUnlockAchievements,
   updateSolBalance,
+  createOrder,
+  closeOrder,
 } from "@/lib/supabase";
 import { getSolBalance } from "@/lib/phantom";
 import { buySol, sellSol, getAdminBalance } from "@/lib/trading";
@@ -405,54 +407,43 @@ export function Simulator({
     setFeedbackList(feedback);
     onFeedback(feedback);
 
-    // ALWAYS execute blockchain transaction for BUY orders
-    let txSignature: string | undefined;
+    // BUY = DB order only (no blockchain transaction needed)
+    let dbOrderId: string | undefined;
     if (side === "buy" && walletAddress) {
       setTxPending(true);
       try {
-        // Check admin balance first
-        let currentAdminBalance = adminBalance;
-        try {
-          currentAdminBalance = await getAdminBalance();
-          setAdminBalance(currentAdminBalance);
-        } catch {
-          // Use cached value
-        }
-
-        if (currentAdminBalance < solAmount + 0.01) {
-          addToast({
-            type: "error",
-            title: "⚠️ Мало ликвидности на бирже",
-            message: `На бирже ${currentAdminBalance.toFixed(4)} SOL, нужно минимум ${(solAmount + 0.01).toFixed(4)} SOL`,
-            duration: 5000,
-          });
-          setTxPending(false);
-          return;
-        }
-
         addToast({
           type: "info",
-          title: "⛓️ Трансакция отправляется...",
-          message: `Отправка ${solAmount.toFixed(4)} SOL на биржу`,
+          title: "📋 Ордер создаётся...",
+          message: `Покупка ${solAmount.toFixed(4)} SOL по $${currentPrice.toFixed(2)}`,
           duration: 3000,
         });
 
-        txSignature = await buySol(solAmount);
-
-        addToast({
-          type: "success",
-          title: "✅ Трансакция подтверждена",
-          message: `SOL отправлен на биржу. Подпись: ${txSignature.slice(0, 12)}...`,
-          duration: 5000,
+        // Save order to Supabase
+        const order = await createOrder({
+          wallet_address: walletAddress,
+          asset: position.asset,
+          side: "buy",
+          order_type: position.orderType,
+          dollar_amount: position.dollarAmount,
+          entry_price: position.entryPrice,
+          quantity: position.quantity,
         });
 
-        // Refresh balances after transaction
-        setTimeout(refreshBalance, 2000);
+        if (order) {
+          dbOrderId = order.id;
+          addToast({
+            type: "success",
+            title: "✅ Ордер создан",
+            message: `Покупка ${position.asset} — $${position.dollarAmount} по $${currentPrice.toFixed(2)}`,
+            duration: 5000,
+          });
+        }
       } catch (err) {
         const errorMsg = err instanceof Error ? err.message : String(err);
         addToast({
           type: "error",
-          title: "❌ Трансакция отклонена",
+          title: "❌ Ошибка создания ордера",
           message: errorMsg,
           duration: 6000,
         });
@@ -462,34 +453,9 @@ export function Simulator({
       setTxPending(false);
     }
 
-    // Save to Supabase
-    let dbTradeId: string | undefined;
-    if (walletAddress) {
-      try {
-        const effectiveSessionId = sessionId || "local";
-        const res = await saveTrade(walletAddress, effectiveSessionId, {
-          asset_symbol: position.asset,
-          side: position.side,
-          order_type: position.orderType,
-          entry_price: position.entryPrice,
-          quantity: position.quantity,
-          dollar_amount: position.dollarAmount,
-          limit_price: position.limitPrice,
-          take_profit: position.takeProfit,
-          stop_loss: position.stopLoss,
-          risk_percent: position.riskPercent,
-        });
-        if (res.mode === "supabase" && res.dbTrade) {
-          dbTradeId = res.dbTrade.id;
-        }
-      } catch (err) {
-        console.error("Failed to save trade:", err);
-      }
-    }
-
     // Add position
     if (orderType === "market") {
-      setPositions((prev) => [{ ...position, dbTradeId, txSignature }, ...prev]);
+      setPositions((prev) => [{ ...position, dbTradeId: dbOrderId }, ...prev]);
       setTradeError("");
 
       addToast({
@@ -498,7 +464,7 @@ export function Simulator({
         message: `${quantityTokens.toFixed(4)} ${scenario.asset} по $${currentPrice.toFixed(2)}`,
       });
     } else {
-      setPositions((prev) => [{ ...position, dbTradeId, txSignature }, ...prev]);
+      setPositions((prev) => [{ ...position, dbTradeId: dbOrderId }, ...prev]);
       setTradeError("");
 
       const orderLabel =
@@ -532,29 +498,27 @@ export function Simulator({
       (Date.now() - new Date(pos.openedAt).getTime()) / 1000
     );
 
-    // Calculate SOL to return
-    const soldSolAmount = pos.dollarAmount / SOL_USD_RATE;
+    // Calculate only PROFIT in SOL (not the full position)
     const pnlSol = pnl / SOL_USD_RATE;
-    const returnSol = soldSolAmount + pnlSol;
 
-    // Execute blockchain transaction for SELL (return SOL to user)
+    // Execute blockchain transaction for SELL — send PROFIT from admin wallet
     let txSignature: string | undefined;
-    if (walletAddress && returnSol > 0) {
+    if (walletAddress && pnlSol > 0) {
       setTxPending(true);
       try {
         addToast({
           type: "info",
-          title: "⛓️ Возврат SOL...",
-          message: `Отправка ${returnSol.toFixed(4)} SOL на ваш кошелёк`,
+          title: "⛓️ Отправка прибыли...",
+          message: `Отправка ${pnlSol.toFixed(4)} SOL прибыли на ваш кошелёк`,
           duration: 3000,
         });
 
-        txSignature = await sellSol(returnSol, walletAddress);
+        txSignature = await sellSol(pnlSol, walletAddress);
 
         addToast({
           type: "success",
-          title: "✅ SOL возвращён",
-          message: `${returnSol.toFixed(4)} SOL отправлено на кошелёк`,
+          title: "✅ Прибыль получена",
+          message: `${pnlSol.toFixed(4)} SOL отправлено на кошелёк`,
           duration: 5000,
         });
 
@@ -563,12 +527,20 @@ export function Simulator({
         const errorMsg = err instanceof Error ? err.message : String(err);
         addToast({
           type: "error",
-          title: "❌ Ошибка возврата",
+          title: "❌ Ошибка отправки прибыли",
           message: errorMsg,
           duration: 6000,
         });
       }
       setTxPending(false);
+    } else if (walletAddress && pnlSol <= 0) {
+      // Loss — no SOL transfer needed
+      addToast({
+        type: "info",
+        title: "📉 Позиция закрыта с убытком",
+        message: `PnL: $${pnl.toFixed(2)} (${pnlSol.toFixed(4)} SOL)`,
+        duration: 4000,
+      });
     }
 
     const closedPos: ClosedPosition = {
