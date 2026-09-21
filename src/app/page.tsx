@@ -72,7 +72,9 @@ function Home() {
           </div>
           <WalletConnect
             walletAddress={walletAddress}
-            onConnect={setWalletAddress}
+            onConnect={(addr) => {
+              setWalletAddress(addr);
+            }}
             onDisconnect={() => {
               setWalletAddress(null);
               setClosedPositions([]);

@@ -13,9 +13,6 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="ru">
-      <head>
-        <script src="/solana-web3.min.js" />
-      </head>
       <body>{children}</body>
     </html>
   );

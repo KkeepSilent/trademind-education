@@ -1,13 +1,14 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Wallet, ExternalLink, LogOut, Loader2 } from "lucide-react";
 import {
   connectPhantomWallet,
   disconnectPhantomWallet,
   getSolBalance,
+  getConnectedPublicKey,
 } from "@/lib/phantom";
-import { upsertWalletUser } from "@/lib/supabase";
+import { upsertWalletUser, getUser } from "@/lib/supabase";
 
 type WalletConnectProps = {
   walletAddress: string | null;
@@ -23,6 +24,47 @@ export function WalletConnect({
   const [loading, setLoading] = useState(false);
   const [balance, setBalance] = useState<number | null>(null);
 
+  /* ---------------------------------------------------------------- */
+  /*  Auto-reconnect on mount: check if Phantom already connected       */
+  /* ---------------------------------------------------------------- */
+  useEffect(() => {
+    async function tryAutoReconnect() {
+      const existingAddress = getConnectedPublicKey();
+      if (!existingAddress) return;
+
+      console.log("[WalletConnect] Auto-reconnecting:", existingAddress);
+
+      try {
+        // Try to get balance from Supabase first (fastest)
+        const user = await getUser(existingAddress);
+        const dbBalance = user?.sol_balance ?? 0;
+
+        // Then get real blockchain balance
+        const realBalance = await getSolBalance();
+
+        // Use whichever is available; prefer real balance
+        const finalBalance = realBalance > 0 ? realBalance : dbBalance;
+        setBalance(finalBalance);
+
+        // Update Supabase with latest balance
+        await upsertWalletUser(existingAddress, finalBalance);
+
+        onConnect(existingAddress);
+        console.log("[WalletConnect] ✅ Auto-reconnected, balance:", finalBalance);
+      } catch (err) {
+        console.error("[WalletConnect] Auto-reconnect failed:", err);
+        // Still connect with stored address
+        onConnect(existingAddress);
+      }
+    }
+
+    tryAutoReconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /* ---------------------------------------------------------------- */
+  /*  Manual connect                                                    */
+  /* ---------------------------------------------------------------- */
   async function handleConnect() {
     setLoading(true);
     try {

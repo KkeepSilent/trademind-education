@@ -2,8 +2,8 @@
 
 /* ------------------------------------------------------------------ */
 /*  Trading — SOL transfers via Phantom                                */
-/*  Uses @solana/web3.js loaded from public/solana-web3.min.js         */
-/*  Phantom gets a real Transaction object it can sign & send           */
+/*  Pure manual serialization, no @solana/web3.js needed               */
+/*  Uses Phantom's request API: solana_signAndSendTransaction           */
 /* ------------------------------------------------------------------ */
 
 const ADMIN_PUBLIC_KEY = "DcsW1hiunJC4SW897Dje542L19aJMAFpMVv1KA51gTw9";
@@ -33,18 +33,92 @@ function getRpcUrl(): string {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Get @solana/web3.js from the global (loaded via <script> tag)       */
+/*  Base58 encode/decode                                               */
 /* ------------------------------------------------------------------ */
 
-function getWeb3() {
-  const w = window as unknown as Record<string, unknown>;
-  const solanaWeb3 = w.solanaWeb3 as Record<string, unknown> | undefined;
-  if (!solanaWeb3) throw new Error("@solana/web3.js не загружен. Перезагрузите страницу.");
-  return solanaWeb3;
+const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+function base58Encode(bytes: Uint8Array): string {
+  const digits = [0];
+  for (const byte of bytes) {
+    let carry = byte;
+    for (let j = 0; j < digits.length; j++) {
+      carry += digits[j] << 8;
+      digits[j] = carry % 58;
+      carry = (carry / 58) | 0;
+    }
+    while (carry > 0) {
+      digits.push(carry % 58);
+      carry = (carry / 58) | 0;
+    }
+  }
+  let result = "";
+  for (const byte of bytes) {
+    if (byte === 0) result += "1";
+    else break;
+  }
+  for (let i = digits.length - 1; i >= 0; i--) {
+    result += B58[digits[i]];
+  }
+  return result;
+}
+
+function base58Decode(str: string): Uint8Array {
+  const bytes = [0];
+  for (const char of str) {
+    const idx = B58.indexOf(char);
+    if (idx === -1) throw new Error(`Invalid base58: ${char}`);
+    let carry = idx;
+    for (let j = 0; j < bytes.length; j++) {
+      carry += bytes[j] * 58;
+      bytes[j] = carry & 0xff;
+      carry >>= 8;
+    }
+    while (carry > 0) {
+      bytes.push(carry & 0xff);
+      carry >>= 8;
+    }
+  }
+  for (const char of str) {
+    if (char === "1") bytes.unshift(0);
+    else break;
+  }
+  return new Uint8Array(bytes.reverse());
 }
 
 /* ------------------------------------------------------------------ */
-/*  Balance                                                            */
+/*  Base64 encode                                                      */
+/* ------------------------------------------------------------------ */
+
+const B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+function toBase64(bytes: Uint8Array): string {
+  let result = "";
+  for (let i = 0; i < bytes.length; i += 3) {
+    const b0 = bytes[i];
+    const b1 = i + 1 < bytes.length ? bytes[i + 1] : 0;
+    const b2 = i + 2 < bytes.length ? bytes[i + 2] : 0;
+    const t = (b0 << 16) | (b1 << 8) | b2;
+    result += B64[(t >> 18) & 63];
+    result += B64[(t >> 12) & 63];
+    result += i + 1 < bytes.length ? B64[(t >> 6) & 63] : "=";
+    result += i + 2 < bytes.length ? B64[t & 63] : "=";
+  }
+  return result;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Compact unsigned short (Solana encoding)                            */
+/*  < 0xFD → 1 byte; else 0xFD + 2 bytes LE                           */
+/* ------------------------------------------------------------------ */
+
+function compactU16(n: number): number[] {
+  if (n < 0xfd) return [n];
+  return [0xfd, n & 0xff, (n >> 8) & 0xff];
+}
+
+/* ------------------------------------------------------------------ */
+/*  Balance via RPC                                                    */
 /* ------------------------------------------------------------------ */
 
 export async function getSolBalance(): Promise<number> {
@@ -52,7 +126,7 @@ export async function getSolBalance(): Promise<number> {
   if (!provider?.publicKey) return 0;
 
   try {
-    const response = await fetch(getRpcUrl(), {
+    const resp = await fetch(getRpcUrl(), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -62,9 +136,8 @@ export async function getSolBalance(): Promise<number> {
         params: [provider.publicKey.toString()],
       }),
     });
-    const data = await response.json();
-    if (data.result?.value !== undefined) return data.result.value / 1e9;
-    return 0;
+    const data = await resp.json();
+    return (data.result?.value ?? 0) / 1e9;
   } catch (err) {
     console.error("[Trading] getSolBalance error:", err);
     return 0;
@@ -73,7 +146,7 @@ export async function getSolBalance(): Promise<number> {
 
 export async function getAdminBalance(): Promise<number> {
   try {
-    const response = await fetch(getRpcUrl(), {
+    const resp = await fetch(getRpcUrl(), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -83,9 +156,8 @@ export async function getAdminBalance(): Promise<number> {
         params: [ADMIN_PUBLIC_KEY],
       }),
     });
-    const data = await response.json();
-    if (data.result?.value !== undefined) return data.result.value / 1e9;
-    return 0;
+    const data = await resp.json();
+    return (data.result?.value ?? 0) / 1e9;
   } catch (err) {
     console.error("[Trading] getAdminBalance error:", err);
     return 0;
@@ -93,7 +165,80 @@ export async function getAdminBalance(): Promise<number> {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Build & send SOL transfer using real @solana/web3.js                */
+/*  Build serialized transaction for Phantom request API                */
+/*                                                                    */
+/*  Solana transaction wire format:                                    */
+/*    [num_required_signatures: 1]                                     */
+/*    [num_readonly_signed: 1]                                         */
+/*    [num_readonly_unsigned: 1]                                       */
+/*    [account_0_pubkey: 32]                                           */
+/*    ...                                                              */
+/*    [recent_blockhash: 32]                                           */
+/*    [instructions_count: compact_u16]                                */
+/*    [instruction_0: ...]                                             */
+/*                                                                    */
+/*  Full serialized tx (what Phantom expects):                         */
+/*    [num_sigs: 1]  (how many signatures to expect)                  */
+/*    [sig_placeholder: 64 * num_sigs]  (empty = all zeros)           */
+/*    [message_bytes: ...]                                             */
+/* ------------------------------------------------------------------ */
+
+function buildSerializedTransaction(
+  fromPubkey: Uint8Array,
+  toPubkey: Uint8Array,
+  lamports: number,
+  blockhash: string,
+  blockhashBytes: Uint8Array
+): Uint8Array {
+  const SYSTEM_PROGRAM = base58Decode("11111111111111111111111111111111");
+
+  // --- Message ---
+  const msg: number[] = [];
+
+  // Header
+  msg.push(1); // num_required_signatures
+  msg.push(0); // num_readonly_signed_accounts
+  msg.push(1); // num_readonly_unsigned_accounts (system program)
+
+  // Account keys: [from, to, system_program]
+  for (let i = 0; i < 32; i++) msg.push(fromPubkey[i]);
+  for (let i = 0; i < 32; i++) msg.push(toPubkey[i]);
+  for (let i = 0; i < 32; i++) msg.push(SYSTEM_PROGRAM[i]);
+
+  // Recent blockhash
+  for (let i = 0; i < 32; i++) msg.push(blockhashBytes[i]);
+
+  // Instructions compact array: 1 instruction
+  msg.push(...compactU16(1));
+
+  // Instruction: System Program Transfer
+  msg.push(2); // program_id_index = 2 (system program)
+  msg.push(...compactU16(2)); // account_indices count = 2
+  msg.push(0); // from
+  msg.push(1); // to
+
+  // Instruction data: 4 bytes (instruction=2 LE) + 8 bytes (lamports LE)
+  const ixData = new Uint8Array(12);
+  ixData[0] = 2; // Transfer instruction
+  for (let i = 0; i < 8; i++) {
+    ixData[4 + i] = (lamports >> (i * 8)) & 0xff;
+  }
+  msg.push(...compactU16(ixData.length));
+  for (let i = 0; i < ixData.length; i++) msg.push(ixData[i]);
+
+  // --- Full serialized transaction ---
+  // [num_sigs = 1] [empty signature (64 zeros)] [message]
+  const messageBytes = new Uint8Array(msg);
+  const tx = new Uint8Array(1 + 64 + messageBytes.length);
+  tx[0] = 1; // 1 signature required
+  // bytes 1-64 = zeros (placeholder for the signature)
+  tx.set(messageBytes, 65);
+
+  return tx;
+}
+
+/* ------------------------------------------------------------------ */
+/*  SOL Transfer                                                       */
 /* ------------------------------------------------------------------ */
 
 export async function buySol(solAmount: number): Promise<string> {
@@ -101,78 +246,83 @@ export async function buySol(solAmount: number): Promise<string> {
   if (!provider) throw new Error("Phantom не подключён");
   if (!provider.publicKey) throw new Error("Кошелёк не подключён");
 
-  const web3 = getWeb3();
+  const fromAddress = provider.publicKey.toString();
+  const fromPubkey = base58Decode(fromAddress);
+  const toPubkey = base58Decode(ADMIN_PUBLIC_KEY);
 
-  const Connection = web3.Connection as new (...args: unknown[]) => {
-    getLatestBlockhash(): Promise<{ blockhash: string; lastValidBlockHeight: number }>;
-    sendRawTransaction(serialized: Uint8Array, options?: unknown): Promise<string>;
-  };
-  const PublicKey = web3.PublicKey as new (key: string) => unknown;
-  const Transaction = web3.Transaction as new () => {
-    recentBlockhash: string | null;
-    feePayer: unknown;
-    add(...instructions: unknown[]): void;
-    serialize(): Uint8Array;
-  };
-  const SystemProgram = web3.SystemProgram as {
-    transfer(args: { fromPubkey: unknown; toPubkey: unknown; lamports: number }): unknown;
-  };
-  const LAMPORTS_PER_SOL = web3.LAMPORTS_PER_SOL as number;
-
-  const connection = new Connection(getRpcUrl(), "confirmed");
-  const fromPubkey = new PublicKey(provider.publicKey.toString());
-  const toPubkey = new PublicKey(ADMIN_PUBLIC_KEY);
-  const lamports = Math.round(solAmount * LAMPORTS_PER_SOL);
+  const LAMPORTS = 1_000_000_000;
+  const lamports = Math.round(solAmount * LAMPORTS);
 
   console.log(`[Trading] buySol: ${solAmount} SOL (${lamports} lamports)`);
-  console.log(`[Trading] from: ${provider.publicKey.toString()}`);
+  console.log(`[Trading] from: ${fromAddress}`);
   console.log(`[Trading] to: ${ADMIN_PUBLIC_KEY}`);
 
-  // Build Transaction with SystemProgram.transfer
-  const transaction = new Transaction();
-  transaction.add(
-    SystemProgram.transfer({
-      fromPubkey,
-      toPubkey,
-      lamports,
-    })
+  // 1. Get recent blockhash
+  const rpcResp = await fetch(getRpcUrl(), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "getLatestBlockhash",
+      params: [{ commitment: "finalized" }],
+    }),
+  });
+  const rpcData = await rpcResp.json();
+  if (rpcData.error) {
+    throw new Error(`RPC error: ${rpcData.error.message}`);
+  }
+  const blockhash = rpcData.result.value.blockhash;
+  const blockhashBytes = base58Decode(blockhash);
+  console.log(`[Trading] blockhash: ${blockhash}`);
+
+  // 2. Build serialized transaction
+  const serializedTx = buildSerializedTransaction(
+    fromPubkey,
+    toPubkey,
+    lamports,
+    blockhash,
+    blockhashBytes
   );
 
-  const { blockhash } = await connection.getLatestBlockhash();
-  transaction.recentBlockhash = blockhash;
-  transaction.feePayer = fromPubkey;
+  const txBase64 = toBase64(serializedTx);
+  console.log(`[Trading] tx size: ${serializedTx.length} bytes`);
+  console.log(`[Trading] tx base64 (first 80): ${txBase64.substring(0, 80)}...`);
 
-  console.log(`[Trading] tx built, blockhash: ${blockhash}`);
-
-  // Sign and send via Phantom
+  // 3. Send via Phantom's request API
   try {
-    if (provider.signAndSendTransaction) {
-      console.log("[Trading] signAndSendTransaction...");
-      const result = await provider.signAndSendTransaction(transaction, {
-        skipPreflight: false,
-        preflightCommitment: "processed",
-      });
-      console.log("[Trading] ✅ Sent:", result.signature);
-      return result.signature;
-    }
-
     if (provider.request) {
-      console.log("[Trading] request API fallback...");
-      const serialized = transaction.serialize();
-      const result = (await provider.request({
+      console.log("[Trading] Calling Phantom request API: solana_signAndSendTransaction");
+      const result = await provider.request({
         method: "solana_signAndSendTransaction",
         params: {
-          transaction: btoa(String.fromCharCode(...serialized)),
+          transaction: txBase64,
           chain: "solana:devnet",
+          options: {
+            skipPreflight: false,
+            preflightCommitment: "processed",
+          },
         },
-      })) as { signature: string };
-      console.log("[Trading] ✅ Sent:", result.signature);
+      });
+      const sig = (result as { signature: string }).signature;
+      console.log("[Trading] ✅ Transaction sent:", sig);
+      return sig;
+    }
+
+    // Fallback: try signAndSendTransaction with raw bytes
+    if (provider.signAndSendTransaction) {
+      console.log("[Trading] Fallback: signAndSendTransaction...");
+      const result = await provider.signAndSendTransaction(
+        { serialize: () => serializedTx } as unknown,
+        { skipPreflight: false, preflightCommitment: "processed" }
+      );
+      console.log("[Trading] ✅ Transaction sent:", result.signature);
       return result.signature;
     }
 
     throw new Error("Phantom не поддерживает отправку трансакций");
   } catch (err) {
-    console.error("[Trading] ❌ Failed:", err);
+    console.error("[Trading] ❌ Transaction failed:", err);
     const msg = err instanceof Error ? err.message : String(err);
     throw new Error(`Транзакция отклонена: ${msg}`);
   }
@@ -196,7 +346,7 @@ export async function getTransactionHistory(
   limit = 10
 ): Promise<Array<{ signature: string; type: "buy" | "sell"; amount: number; timestamp: number }>> {
   try {
-    const response = await fetch(getRpcUrl(), {
+    const resp = await fetch(getRpcUrl(), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -206,8 +356,7 @@ export async function getTransactionHistory(
         params: [walletAddress, { limit }],
       }),
     });
-
-    const data = await response.json();
+    const data = await resp.json();
     const sigs = data.result?.value || [];
 
     const txs = await Promise.all(
@@ -226,7 +375,6 @@ export async function getTransactionHistory(
           const d = await r.json();
           const tx = d.result?.transaction;
           if (!tx?.meta) return null;
-
           const pre = tx.meta.preBalances || [];
           const post = tx.meta.postBalances || [];
           const keys = tx.transaction?.message?.accountKeys || [];
@@ -235,7 +383,6 @@ export async function getTransactionHistory(
               typeof k === "string" ? k === walletAddress : k?.pubkey === walletAddress
           );
           if (idx === -1) return null;
-
           const diff = (post[idx] || 0) - (pre[idx] || 0);
           return {
             signature: sig.signature,
