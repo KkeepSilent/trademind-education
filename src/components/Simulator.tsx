@@ -224,7 +224,7 @@ export function Simulator({
   const quantityTokens =
     dollarAmount > 0 && currentPrice > 0 ? dollarAmount / currentPrice : 0;
   const canOpenTrade =
-    dollarAmount > 0 && dollarAmount <= availableBalance && currentPrice > 0;
+    dollarAmount > 0 && currentPrice > 0 && (side === "buy" || dollarAmount <= availableBalance);
 
   const priceMin = useMemo(() => {
     const lows = visibleCandles.map((c) => c.low);
