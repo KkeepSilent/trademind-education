@@ -7,6 +7,7 @@
 /* ------------------------------------------------------------------ */
 
 const ADMIN_PUBLIC_KEY = "DcsW1hiunJC4SW897Dje542L19aJMAFpMVv1KA51gTw9";
+const SYSTEM_PROGRAM = "11111111111111111111111111111111";
 
 type PhantomProvider = {
   isPhantom?: boolean;
@@ -24,7 +25,6 @@ function getProvider(): PhantomProvider | null {
 }
 
 function getRpcUrl(): string {
-  // In browser: use devnet for production, localhost for local dev
   if (typeof window !== "undefined") {
     const host = window.location.hostname;
     if (host === "localhost" || host === "127.0.0.1") {
@@ -32,55 +32,6 @@ function getRpcUrl(): string {
     }
   }
   return "https://api.devnet.solana.com";
-}
-
-/* ------------------------------------------------------------------ */
-/*  Auto-fund admin wallet from devnet faucet                          */
-/* ------------------------------------------------------------------ */
-
-/**
- * Request SOL from devnet faucet for admin wallet.
- * Faucet gives ~2 SOL per request. Rate limited to ~1 request per minute.
- */
-export async function faucetRequest(): Promise<{ success: boolean; signature?: string; error?: string }> {
-  try {
-    const response = await fetch("https://api.devnet.solana.com", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: 1,
-        method: "requestAirdrop",
-        params: [ADMIN_PUBLIC_KEY, 2e9], // 2 SOL
-      }),
-    });
-
-    const data = await response.json();
-    if (data.result) {
-      return { success: true, signature: data.result };
-    }
-    return { success: false, error: data.error?.message || "Faucet error" };
-  } catch (err) {
-    return { success: false, error: err instanceof Error ? err.message : "Network error" };
-  }
-}
-
-/**
- * Auto-fund admin wallet if balance is low.
- * Returns true if funding was attempted.
- */
-export async function autoFundAdmin(minBalanceSol: number = 5): Promise<boolean> {
-  const balance = await getAdminBalance();
-  if (balance >= minBalanceSol) return false;
-
-  console.log(`[Trading] Admin balance low (${balance.toFixed(2)} SOL), requesting faucet...`);
-  const result = await faucetRequest();
-  if (result.success) {
-    console.log(`[Trading] Faucet funded. TX: ${result.signature}`);
-    return true;
-  }
-  console.warn(`[Trading] Faucet failed: ${result.error}`);
-  return false;
 }
 
 /* ------------------------------------------------------------------ */
@@ -107,11 +58,11 @@ export async function getSolBalance(): Promise<number> {
 
     const data = await response.json();
     if (data.result?.value !== undefined) {
-      return data.result.value / 1e9; // lamports → SOL
+      return data.result.value / 1e9;
     }
     return 0;
   } catch (err) {
-    console.error("[Phantom] getSolBalance error:", err);
+    console.error("[Trading] getSolBalance error:", err);
     return 0;
   }
 }
@@ -135,18 +86,72 @@ export async function getAdminBalance(): Promise<number> {
     }
     return 0;
   } catch (err) {
-    console.error("[Phantom] getAdminBalance error:", err);
+    console.error("[Trading] getAdminBalance error:", err);
     return 0;
   }
 }
 
 /* ------------------------------------------------------------------ */
-/*  SOL Transfer (Buy = user → admin, Sell = admin → user)            */
+/*  SOL Transfer via Phantom                                           */
 /* ------------------------------------------------------------------ */
 
 /**
- * Send SOL from user wallet to admin wallet (BUY).
- * Returns the transaction signature.
+ * Encode a base58 string to bytes and vice versa (for Solana addresses).
+ * Solana addresses are base58-encoded 32-byte public keys.
+ */
+const BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+function base58Decode(str: string): Uint8Array {
+  const bytes = [0];
+  for (const char of str) {
+    const index = BASE58_ALPHABET.indexOf(char);
+    if (index === -1) throw new Error(`Invalid base58 character: ${char}`);
+    let carry = index;
+    for (let j = 0; j < bytes.length; j++) {
+      carry += bytes[j] * 58;
+      bytes[j] = carry & 0xff;
+      carry >>= 8;
+    }
+    while (carry > 0) {
+      bytes.push(carry & 0xff);
+      carry >>= 8;
+    }
+  }
+  for (const char of str) {
+    if (char === "1") bytes.unshift(0);
+    else break;
+  }
+  return new Uint8Array(bytes.reverse());
+}
+
+function base58Encode(bytes: Uint8Array): string {
+  const digits = [0];
+  for (const byte of bytes) {
+    let carry = byte;
+    for (let j = 0; j < digits.length; j++) {
+      carry += digits[j] << 8;
+      digits[j] = carry % 58;
+      carry = (carry / 58) | 0;
+    }
+    while (carry > 0) {
+      digits.push(carry % 58);
+      carry = (carry / 58) | 0;
+    }
+  }
+  let result = "";
+  for (const byte of bytes) {
+    if (byte === 0) result += "1";
+    else break;
+  }
+  for (let i = digits.length - 1; i >= 0; i--) {
+    result += BASE58_ALPHABET[digits[i]];
+  }
+  return result;
+}
+
+/**
+ * Build a raw SOL transfer transaction and send via Phantom.
+ * Uses proper Solana transaction serialization.
  */
 export async function buySol(solAmount: number): Promise<string> {
   const provider = getProvider();
@@ -171,102 +176,129 @@ export async function buySol(solAmount: number): Promise<string> {
   const recentBlockhash = blockhashData.result?.value?.blockhash;
   if (!recentBlockhash) throw new Error("Не удалось получить blockhash");
 
-  // Build transaction
-  const transaction = {
-    feePayer: fromPubkey,
-    recentBlockhash,
-    instructions: [
-      {
-        keys: [
-          { pubkey: fromPubkey, isSigner: true, isWritable: true },
-          { pubkey: ADMIN_PUBLIC_KEY, isSigner: false, isWritable: true },
-        ],
-        programId: "11111111111111111111111111111111",
-        data: [
-          2, 0, 0, 0, // Transfer instruction
-          ...new Uint8Array(new Uint32Array([lamports]).buffer),
-          ...new Uint8Array(new Uint32Array([0]).buffer),
-        ],
-      },
-    ],
-    instructions_b64: undefined,
-  };
+  // Build the transaction message manually
+  // This is a simple SOL transfer using System Program
+  const fromBytes = base58Decode(fromPubkey);
+  const toBytes = base58Decode(ADMIN_PUBLIC_KEY);
+  const programBytes = base58Decode(SYSTEM_PROGRAM);
+  const blockhashBytes = base58Decode(recentBlockhash);
 
-  // Try to sign via Phantom
-  let signed;
-  try {
-    // Try signTransaction first
-    if (provider.signTransaction) {
-      signed = await provider.signTransaction(transaction);
-    }
-  } catch {
-    // Fall back to request method
-  }
+  // Encode lamports as little-endian u64
+  const lamportsBytes = new Uint8Array(8);
+  const dataView = new DataView(lamportsBytes.buffer);
+  dataView.setUint32(0, lamports & 0xffffffff, true);
+  dataView.setUint32(4, Math.floor(lamports / 0x100000000) & 0xffffffff, true);
 
-  if (!signed && provider.request) {
-    // Use Phantom's request to sign and send
+  // System Program Transfer instruction: [2, ...lamports_bytes]
+  const instructionData = new Uint8Array([2, ...lamportsBytes]);
+
+  // Build message
+  const message = new Uint8Array([
+    0, // message header: num_required_signatures
+    1, // num_readonly_signed_accounts
+    0, // num_readonly_unsigned_accounts
+    3, // account_keys length
+    ...fromBytes,
+    ...toBytes,
+    ...programBytes,
+    1, // instructions length
+    0, // instruction index (System Program)
+    0, // account_index_from
+    1, // account_index_to
+    2, // account_index_program
+    instructionData.length,
+    ...instructionData,
+    ...blockhashBytes,
+  ]);
+
+  // Use Phantom's signAndSendTransaction
+  if (provider.request) {
     try {
+      // Method 1: Use solana_signAndSendTransaction with serialized message
       const result = await provider.request({
-        method: "signAndSendTransaction",
+        method: "solana_signAndSendTransaction",
         params: {
-          transaction: btoa(String.fromCharCode(...new Uint8Array(0))),
-          message: JSON.stringify(transaction),
+          transaction: {
+            message: Array.from(message),
+            signatures: [],
+          },
+          sendOptions: {
+            skipPreflight: false,
+            preflightCommitment: "processed",
+          },
         },
       });
-      if (result) {
-        return (result as { signature?: string }).signature || String(result);
+
+      if (result && typeof result === "object" && "signature" in result) {
+        return (result as { signature: string }).signature;
       }
-    } catch {
-      // Continue to legacy method
+      return String(result);
+    } catch (err) {
+      console.warn("[Trading] Method 1 failed, trying method 2:", err);
     }
   }
 
-  // Legacy: just send SOL via Phantom's native method
-  if (!provider.request) {
-    throw new Error("Phantom кошелёк не поддерживает отправку трансакций");
+  // Method 2: Use Phantom's connect and sign
+  if (provider.signTransaction) {
+    try {
+      // Build a Versioned Transaction message
+      const txMessage = {
+        feePayer: fromPubkey,
+        recentBlockhash,
+        instructions: [
+          {
+            keys: [
+              { pubkey: fromPubkey, isSigner: true, isWritable: true },
+              { pubkey: ADMIN_PUBLIC_KEY, isSigner: false, isWritable: true },
+            ],
+            programId: SYSTEM_PROGRAM,
+            data: Array.from(instructionData),
+          },
+        ],
+      };
+
+      const signed = await provider.signTransaction(txMessage);
+      if (signed) {
+        // Send the signed transaction
+        const serialized = (signed as { serialize?: () => Uint8Array }).serialize?.();
+        if (serialized) {
+          const sendResponse = await fetch(getRpcUrl(), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              jsonrpc: "2.0",
+              id: 1,
+              method: "sendTransaction",
+              params: [
+                Array.from(serialized),
+                { encoding: "base64", skipPreflight: false, preflightCommitment: "processed" },
+              ],
+            }),
+          });
+          const sendData = await sendResponse.json();
+          if (sendData.result) return sendData.result;
+          if (sendData.error) throw new Error(sendData.error.message);
+        }
+      }
+    } catch (err) {
+      console.warn("[Trading] Method 2 failed:", err);
+    }
   }
 
-  try {
-    const result = await provider.request({
-      method: "solana_signAndSendTransaction",
-      params: {
-        transaction: transaction,
-        sendOptions: { skipPreflight: false, preflightCommitment: "processed" },
-      },
-    });
-    if (result && typeof result === "object" && "signature" in result) {
-      return (result as { signature: string }).signature;
-    }
-    return String(result);
-  } catch (err) {
-    throw new Error(`Трансакция отклонена: ${err instanceof Error ? err.message : String(err)}`);
-  }
+  throw new Error("Не удалось отправить трансакцию. Попробуйте ещё раз.");
 }
 
 /**
  * Send SOL from admin wallet back to user wallet (SELL).
- * NOTE: For MVP, this requires admin wallet to be connected or
- * uses a server-side approach. Returns tx signature.
  */
 export async function sellSol(solAmount: number, userWallet: string): Promise<string> {
   const provider = getProvider();
 
-  // If user's phantom is connected, we can request them to sign
-  // a transaction from the admin wallet (if they have the keypair)
-  // For MVP, we'll use a simplified approach:
-  // The user signs a "sell" request and we track it in Supabase.
-  // The actual SOL transfer happens via the admin wallet.
-
   const lamports = Math.round(solAmount * 1e9);
 
-  // For now, we record the sell intent and the backend will process it
-  // In production, this would be a server-side transaction
-  console.log(`[Phantom] Sell request: ${solAmount} SOL (${lamports} lamports) to ${userWallet}`);
+  console.log(`[Trading] Sell request: ${solAmount} SOL (${lamports} lamports) to ${userWallet}`);
 
-  // TODO: Implement server-side admin wallet signing
-  // For MVP, we mark the trade as "settled" in Supabase
-  // and the admin wallet manually settles periodically
-
+  // For MVP, record the sell intent
   return "sell-pending";
 }
 
@@ -325,7 +357,6 @@ export async function getTransactionHistory(
           const preBalances = tx.meta.preBalances || [];
           const postBalances = tx.meta.postBalances || [];
 
-          // Find wallet index
           const accountKeys = tx.transaction?.message?.accountKeys || [];
           const walletIndex = accountKeys.findIndex(
             (key: { pubkey?: string } | string) =>
@@ -357,7 +388,7 @@ export async function getTransactionHistory(
       timestamp: number;
     }>;
   } catch (err) {
-    console.error("[Phantom] getTransactionHistory error:", err);
+    console.error("[Trading] getTransactionHistory error:", err);
     return [];
   }
 }

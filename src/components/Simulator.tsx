@@ -35,7 +35,7 @@ import {
   updateSolBalance,
 } from "@/lib/supabase";
 import { getSolBalance } from "@/lib/phantom";
-import { buySol, sellSol, getAdminBalance, autoFundAdmin } from "@/lib/trading";
+import { buySol, sellSol, getAdminBalance } from "@/lib/trading";
 import type {
   Candle,
   MentorFeedback,
@@ -410,13 +410,13 @@ export function Simulator({
         const adminBal = await getAdminBalance();
         if (adminBal < solAmount + 1) {
           addToast({
-            type: "info",
-            title: "💰 Пополнение биржи...",
-            message: "Админ-кошелёк пополняется через faucet",
-            duration: 3000,
+            type: "error",
+            title: "⚠️ Мало ликвидности на бирже",
+            message: `Админ-кошелёк: ${adminBal.toFixed(2)} SOL. Нужно минимум ${(solAmount + 1).toFixed(2)} SOL`,
+            duration: 5000,
           });
-          await autoFundAdmin(solAmount + 5);
-          setTimeout(refreshBalance, 3000);
+          setTxPending(false);
+          return;
         }
 
         addToast({
