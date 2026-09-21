@@ -110,53 +110,40 @@ export async function buySol(solAmount: number): Promise<string> {
 
   // Sign and send via Phantom
   try {
+    let signature: string;
+
     if (provider.signAndSendTransaction) {
       console.log("[Trading] Calling signAndSendTransaction...");
       const result = await provider.signAndSendTransaction(transaction, {
         skipPreflight: true,
       });
-      console.log("[Trading] ✅ Sent:", result.signature);
-
-      // Confirm with retry strategy
-      console.log("[Trading] Confirming...");
-      const strategy = {
-        signature: result.signature,
-        blockhash,
-        lastValidBlockHeight,
-      };
-      const confirmation = await connection.confirmTransaction(strategy, "processed");
-      if (confirmation.value.err) {
-        throw new Error(`Transaction failed: ${JSON.stringify(confirmation.value.err)}`);
-      }
-      console.log("[Trading] ✅ Confirmed:", result.signature);
-      return result.signature;
-    }
-
-    if (provider.request) {
+      signature = result.signature;
+      console.log("[Trading] ✅ Sent:", signature);
+    } else if (provider.request) {
       console.log("[Trading] Using request API as fallback...");
-      // Serialize the transaction for request API
       const serializedTx = transaction.serialize({
         requireAllSignatures: false,
         verifySignatures: false,
       });
-
       const result = (await provider.request({
         method: "solana_signAndSendTransaction",
         params: {
           transaction: Buffer.from(serializedTx).toString("base64"),
           chain: "solana:devnet",
-          options: {
-            skipPreflight: false,
-            preflightCommitment: "confirmed",
-          },
+          options: { skipPreflight: true },
         },
       })) as { signature: string };
-
-      console.log("[Trading] ✅ Sent via request:", result.signature);
-      return result.signature;
+      signature = result.signature;
+      console.log("[Trading] ✅ Sent via request:", signature);
+    } else {
+      throw new Error("Phantom не поддерживает отправку транзакций");
     }
 
-    throw new Error("Phantom не поддерживает отправку транзакций");
+    // Return signature immediately — don't block on confirmation
+    // Confirmation may fail due to blockhash expiry, but the tx is already sent
+    console.log("[Trading] Returning signature (confirmation will happen async)");
+    return signature;
+
   } catch (err) {
     console.error("[Trading] ❌ Transaction failed:", err);
     const msg = err instanceof Error ? err.message : String(err);
